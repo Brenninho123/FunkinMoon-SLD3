@@ -1,0 +1,34 @@
+{
+  "name": "funkinmoon-sld3",
+  "version": "0.2.7",
+  "description": "An advanced library and C-engine foundation for MoonEngine",
+  "main": "source/Main.c",
+  "scripts": {
+    "build": "gcc -std=c99 -O3 -s -Isource -I. source/Main.c -o bin/FunkinMoon-SLD3",
+    "build:debug": "gcc -std=c99 -O0 -g -Isource -I. source/Main.c -o bin/FunkinMoon-SLD3-debug",
+    "clean": "rimraf bin",
+    "sync": "git add . && git commit -m \"Update FunkinMoon-SLD3 build\" && git push origin main"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Brenninho123/FunkinMoon-SLD3.git"
+  },
+  "keywords": [
+    "fnf",
+    "friday-night-funkin",
+    "moon-engine",
+    "sld3",
+    "slendytubbies-3",
+    "c99",
+    "game-engine"
+  ],
+  "author": "Brenninho123",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/Brenninho123/FunkinMoon-SLD3/issues"
+  },
+  "homepage": "https://github.com/Brenninho123/FunkinMoon-SLD3#readme",
+  "devDependencies": {
+    "rimraf": "^5.0.0"
+  }
+}
