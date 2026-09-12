@@ -8,14 +8,13 @@
 #include <stdint.h>
 #include <stdarg.h>
 
-#define SLD3_VERSION_MAJOR 2
+#define SLD3_VERSION_MAJOR 3
 #define SLD3_VERSION_MINOR 0
 #define SLD3_VERSION_PATCH 0
 
 #define SLD3_MAX_PATH 512
 #define SLD3_MAX_NAME 128
-#define SLD3_HASH_SIZE 1024
-#define SLD3_THREAD_POOL_SIZE 4
+#define SLD3_HASH_SIZE 2048
 
 typedef enum {
     SLD3_LOG_DEBUG = 0,
@@ -52,7 +51,7 @@ typedef enum {
     SLD3_STATE_FAILED
 } sld3_asset_state_t;
 
-typedef struct {
+typedef struct sld3_asset {
     char path[SLD3_MAX_PATH];
     char key[SLD3_MAX_NAME];
     sld3_asset_type_t type;
@@ -62,6 +61,7 @@ typedef struct {
     uint32_t checksum;
     void *raw_data;
     uint32_t ref_count;
+    uint64_t last_accessed_frame;
 } sld3_asset_t;
 
 typedef struct {
@@ -87,6 +87,7 @@ typedef struct {
     sld3_node_t *buckets[SLD3_HASH_SIZE];
     size_t total_assets;
     size_t allocated_memory;
+    uint64_t frame_counter;
     sld3_log_callback_t logger;
     bool initialized;
 } sld3_engine_t;
@@ -101,7 +102,9 @@ bool sld3_asset_register(sld3_engine_t *engine, const char *key, const char *pat
 sld3_asset_t *sld3_asset_retain(sld3_engine_t *engine, const char *key);
 bool sld3_asset_release(sld3_engine_t *engine, const char *key);
 bool sld3_asset_preload_all(sld3_engine_t *engine);
-void sld3_engine_garbage_collect(sld3_engine_t *engine);
+
+void sld3_engine_tick(sld3_engine_t *engine);
+void sld3_engine_garbage_collect_lru(sld3_engine_t *engine);
 void sld3_engine_shutdown(sld3_engine_t *engine);
 
 #endif
@@ -149,9 +152,10 @@ void sld3_engine_init(sld3_engine_t *engine, const char *title, const char *vers
     engine->config.target_fps = 60;
     engine->config.vsync = false;
     engine->config.fullscreen = false;
-    engine->config.memory_budget_bytes = 512 * 1024 * 1024;
+    engine->config.memory_budget_bytes = 1024 * 1024 * 1024;
     engine->allocated_memory = 0;
     engine->total_assets = 0;
+    engine->frame_counter = 0;
     engine->logger = NULL;
     engine->initialized = true;
 }
@@ -177,6 +181,12 @@ void sld3_engine_set_logger(sld3_engine_t *engine, sld3_log_callback_t logger) {
     }
 }
 
+void sld3_engine_tick(sld3_engine_t *engine) {
+    if (engine && engine->initialized) {
+        engine->frame_counter++;
+    }
+}
+
 bool sld3_asset_register(sld3_engine_t *engine, const char *key, const char *path, sld3_asset_type_t type, uint32_t flags) {
     if (!engine || !engine->initialized || !key || !path) return false;
     
@@ -199,6 +209,7 @@ bool sld3_asset_register(sld3_engine_t *engine, const char *key, const char *pat
     new_node->asset.raw_data = NULL;
     new_node->asset.size_bytes = 0;
     new_node->asset.ref_count = 0;
+    new_node->asset.last_accessed_frame = engine->frame_counter;
 
     new_node->next = engine->buckets[idx];
     engine->buckets[idx] = new_node;
@@ -223,7 +234,7 @@ static bool sld3_internal_load_asset(sld3_engine_t *engine, sld3_asset_t *asset)
     fseek(f, 0, SEEK_SET);
 
     if (engine->allocated_memory + size > engine->config.memory_budget_bytes) {
-        sld3_engine_garbage_collect(engine);
+        sld3_engine_garbage_collect_lru(engine);
         if (engine->allocated_memory + size > engine->config.memory_budget_bytes) {
             fclose(f);
             asset->state = SLD3_STATE_FAILED;
@@ -265,6 +276,7 @@ sld3_asset_t *sld3_asset_retain(sld3_engine_t *engine, const char *key) {
                 }
             }
             curr->asset.ref_count++;
+            curr->asset.last_accessed_frame = engine->frame_counter;
             return &curr->asset;
         }
         curr = curr->next;
@@ -281,6 +293,7 @@ bool sld3_asset_release(sld3_engine_t *engine, const char *key) {
         if (strcmp(curr->asset.key, key) == 0) {
             if (curr->asset.ref_count > 0) {
                 curr->asset.ref_count--;
+                curr->asset.last_accessed_frame = engine->frame_counter;
                 return true;
             }
             return false;
@@ -308,8 +321,11 @@ bool sld3_asset_preload_all(sld3_engine_t *engine) {
     return success;
 }
 
-void sld3_engine_garbage_collect(sld3_engine_t *engine) {
+void sld3_engine_garbage_collect_lru(sld3_engine_t *engine) {
     if (!engine || !engine->initialized) return;
+
+    sld3_asset_t *lru_asset = NULL;
+    uint64_t oldest_frame = UINT64_MAX;
 
     for (size_t i = 0; i < SLD3_HASH_SIZE; i++) {
         sld3_node_t *curr = engine->buckets[i];
@@ -318,15 +334,22 @@ void sld3_engine_garbage_collect(sld3_engine_t *engine) {
                 curr->asset.state == SLD3_STATE_READY && 
                 !(curr->asset.flags & SLD3_FLAG_CACHE_LOCK)) {
                 
-                engine->allocated_memory -= curr->asset.size_bytes;
-                free(curr->asset.raw_data);
-                curr->asset.raw_data = NULL;
-                curr->asset.size_bytes = 0;
-                curr->asset.state = SLD3_STATE_UNLOADED;
-                sld3_log(engine, SLD3_LOG_INFO, "Evicted asset: %s", curr->asset.key);
+                if (curr->asset.last_accessed_frame < oldest_frame) {
+                    oldest_frame = curr->asset.last_accessed_frame;
+                    lru_asset = &curr->asset;
+                }
             }
             curr = curr->next;
         }
+    }
+
+    if (lru_asset) {
+        engine->allocated_memory -= lru_asset->size_bytes;
+        free(lru_asset->raw_data);
+        lru_asset->raw_data = NULL;
+        lru_asset->size_bytes = 0;
+        lru_asset->state = SLD3_STATE_UNLOADED;
+        sld3_log(engine, SLD3_LOG_INFO, "Evicted LRU asset: %s", lru_asset->key);
     }
 }
 
@@ -348,6 +371,7 @@ void sld3_engine_shutdown(sld3_engine_t *engine) {
 
     engine->total_assets = 0;
     engine->allocated_memory = 0;
+    engine->frame_counter = 0;
     engine->initialized = false;
 }
 
